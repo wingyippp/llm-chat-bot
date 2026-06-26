@@ -80,13 +80,20 @@ class InferenceThread(QThread):
         self.prompt = prompt
         self.params = params
         self.process = None
+        self.prompt_file = None
         
     def run(self):
         try:
+            # 使用临时文件传递 prompt，避免命令行编码问题
+            import tempfile
+            self.prompt_file = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt', delete=False)
+            self.prompt_file.write(self.prompt)
+            self.prompt_file.close()
+            
             cmd = [
                 str(self.llama_path),
                 "-m", str(self.model_path),
-                "-p", self.prompt,
+                "-f", self.prompt_file.name,  # 使用文件而不是 -p 参数
                 "-n", str(self.params.get('max_tokens', 2048)),
                 "--temp", str(self.params.get('temperature', 0.7)),
                 "-c", str(self.params.get('context_size', 4096)),
@@ -114,6 +121,13 @@ class InferenceThread(QThread):
             
             self.process.wait()
             
+            # 清理临时文件
+            try:
+                import os
+                os.unlink(self.prompt_file.name)
+            except:
+                pass
+            
             if self.process.returncode == 0:
                 self.finished_response.emit()
             else:
@@ -129,6 +143,13 @@ class InferenceThread(QThread):
     def stop(self):
         if self.process:
             self.process.terminate()
+        # 清理临时文件
+        if self.prompt_file:
+            try:
+                import os
+                os.unlink(self.prompt_file.name)
+            except:
+                pass
 
 
 class ChatWindow(QMainWindow):
@@ -160,6 +181,7 @@ class ChatWindow(QMainWindow):
         
         self.init_ui()
         QTimer.singleShot(100, self.check_model)
+        QTimer.singleShot(200, self.detect_gpu_and_set_default)
         
     def init_ui(self):
         central_widget = QWidget()
@@ -250,6 +272,108 @@ class ChatWindow(QMainWindow):
         # 初始禁用输入
         self.input_field.setEnabled(False)
         self.send_button.setEnabled(False)
+        
+    def detect_gpu_and_set_default(self):
+        vram_gb = self.get_gpu_vram()
+        gpu_name = self.get_gpu_name()
+        
+        if vram_gb is None:
+            self.gpu_spin.setValue(0)
+            self.model_status.setText(f"{self.model_status.text()} | 未检测到GPU，使用CPU模式")
+            return
+        
+        if vram_gb < 8:
+            gpu_layers = 0
+            self.model_status.setText(f"{self.model_status.text()} | GPU: {gpu_name} ({vram_gb:.0f}GB)，显存不足，使用CPU模式")
+        elif vram_gb < 12:
+            gpu_layers = 25
+            self.model_status.setText(f"{self.model_status.text()} | GPU: {gpu_name} ({vram_gb:.0f}GB)，建议GPU层: {gpu_layers}")
+        elif vram_gb < 16:
+            gpu_layers = 40
+            self.model_status.setText(f"{self.model_status.text()} | GPU: {gpu_name} ({vram_gb:.0f}GB)，建议GPU层: {gpu_layers}")
+        elif vram_gb < 24:
+            gpu_layers = 60
+            self.model_status.setText(f"{self.model_status.text()} | GPU: {gpu_name} ({vram_gb:.0f}GB)，建议GPU层: {gpu_layers}")
+        else:
+            gpu_layers = 99
+            self.model_status.setText(f"{self.model_status.text()} | GPU: {gpu_name} ({vram_gb:.0f}GB)，建议GPU层: {gpu_layers}")
+        
+        self.gpu_spin.setValue(gpu_layers)
+        
+    def get_gpu_vram(self):
+        try:
+            import subprocess
+            # 使用 nvidia-smi 获取 NVIDIA 显卡显存
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                if lines:
+                    # nvidia-smi 返回 MB，转换为 GB
+                    vram_mb = int(lines[0].strip())
+                    return vram_mb / 1024
+        except:
+            pass
+        
+        # 如果 nvidia-smi 失败，尝试使用 WMI
+        try:
+            result = subprocess.run(
+                ['powershell', '-Command', 
+                 'Get-WmiObject -Class Win32_VideoController | Select-Object AdapterRAM | ConvertTo-Json'],
+                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            import json
+            data = json.loads(result.stdout)
+            
+            max_vram = 0
+            if isinstance(data, list):
+                for gpu in data:
+                    vram = gpu.get('AdapterRAM', 0) / (1024**3)
+                    if vram > max_vram:
+                        max_vram = vram
+            else:
+                max_vram = data.get('AdapterRAM', 0) / (1024**3)
+            
+            # 如果 WMI 返回的值太小或为 0，认为显存不足
+            return max_vram if max_vram >= 4 else None
+        except:
+            return None
+        
+    def get_gpu_name(self):
+        try:
+            import subprocess
+            # 优先使用 nvidia-smi 获取 NVIDIA 显卡名称
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except:
+            pass
+        
+        # 如果 nvidia-smi 失败，使用 WMI
+        try:
+            result = subprocess.run(
+                ['powershell', '-Command', 
+                 'Get-WmiObject -Class Win32_VideoController | Select-Object Name | ConvertTo-Json'],
+                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            import json
+            data = json.loads(result.stdout)
+            
+            if isinstance(data, list):
+                for gpu in data:
+                    name = gpu.get('Name', '')
+                    if name and 'NVIDIA' in name:
+                        return name
+                return data[0].get('Name', '未知') if data else '未知'
+            else:
+                return data.get('Name', '未知')
+        except:
+            return '未知'
         
     def check_model(self):
         if self.model_path.exists():
