@@ -50,3 +50,8 @@ Thumbs.db
 *.tmp
 *.temp
 *.bak
+
+# Downloaded archives
+*.zip
+llama_cuda/
+cudart/
