@@ -14,7 +14,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTextEdit, QPushButton, QLabel, QSpinBox, QProgressBar, QMessageBox
+    QTextEdit, QPushButton, QLabel, QSpinBox, QProgressBar, QMessageBox, QComboBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
@@ -167,27 +167,29 @@ class ChatWindow(QMainWindow):
         # 回退到CPU模式的标志
         self.fallback_to_cpu = False
         
+        # 模型配置：名称、文件名、下载链接、大小描述
+        self.models_config = {
+            'qwen30b': {
+                'name': 'Qwen3-30B-A3B (约18GB)',
+                'filename': 'Qwen3-30B-A3B-Q4_K_M.gguf',
+                'url': 'https://hf-mirror.com/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf',
+                'description': '大模型，效果好但速度慢'
+            },
+            'qwen7b': {
+                'name': 'Qwen2.5-7B-Instruct (约4.5GB)',
+                'filename': 'Qwen2.5-7B-Instruct-Q4_K_M.gguf',
+                'url': 'https://hf-mirror.com/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf',
+                'description': '中型模型，适合CPU，速度快'
+            }
+        }
+        
         # 模型路径检测
         if getattr(sys, 'frozen', False):
             self.app_dir = Path(sys.executable).parent
-            # 尝试多个可能的模型路径
-            model_paths = [
-                self.app_dir / "model" / "Qwen3-30B-A3B-Q4_K_M.gguf",
-                self.app_dir / "_internal" / "model" / "Qwen3-30B-A3B-Q4_K_M.gguf",
-                self.app_dir / "Qwen3-30B-A3B-Q4_K_M.gguf",
-                self.app_dir / "_internal" / "Qwen3-30B-A3B-Q4_K_M.gguf",
-            ]
             llama_paths = [
                 self.app_dir / "llama-cli.exe",
                 self.app_dir / "_internal" / "llama-cli.exe",
             ]
-            
-            # 找到存在的路径
-            self.model_path = None
-            for path in model_paths:
-                if path.exists():
-                    self.model_path = path
-                    break
             
             self.llama_path = None
             for path in llama_paths:
@@ -195,17 +197,16 @@ class ChatWindow(QMainWindow):
                     self.llama_path = path
                     break
             
-            # 如果没找到，使用默认路径（后续会提示下载）
-            if not self.model_path:
-                self.model_path = model_paths[0]
             if not self.llama_path:
-                self.llama_path = llama_paths[1]  # _internal 目录
+                self.llama_path = llama_paths[1]
         else:
             self.app_dir = Path(__file__).parent
             self.llama_path = self.app_dir / "llama-cli.exe"
-            self.model_path = self.app_dir / "model" / "Qwen3-30B-A3B-Q4_K_M.gguf"
         
-        self.model_url = "https://hf-mirror.com/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
+        # 默认使用 Qwen2.5-7B 模型（速度更快）
+        self.current_model_key = 'qwen7b'
+        self.model_path = self.app_dir / "model" / self.models_config[self.current_model_key]['filename']
+        self.model_url = self.models_config[self.current_model_key]['url']
         
         # 读取知识库文件夹中的所有 txt 文件
         self.knowledge_base = self.load_knowledge_base()
@@ -254,6 +255,20 @@ class ChatWindow(QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
         
+        # 模型选择
+        model_layout = QHBoxLayout()
+        model_label = QLabel("选择模型:")
+        model_label.setFont(QFont("Microsoft YaHei", 11))
+        model_layout.addWidget(model_label)
+        
+        self.model_combo = QComboBox()
+        for key, config in self.models_config.items():
+            self.model_combo.addItem(f"{config['name']} - {config['description']}", key)
+        self.model_combo.setCurrentText(f"{self.models_config[self.current_model_key]['name']} - {self.models_config[self.current_model_key]['description']}")
+        self.model_combo.currentIndexChanged.connect(self.on_model_changed)
+        model_layout.addWidget(self.model_combo)
+        layout.addLayout(model_layout)
+        
         # 模型状态
         self.model_status = QLabel("模型状态: 检查中...")
         self.model_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -272,7 +287,7 @@ class ChatWindow(QMainWindow):
         layout.addWidget(self.progress_bar)
         
         # 下载按钮
-        self.download_button = QPushButton("下载模型 (约18GB)")
+        self.download_button = QPushButton("下载模型")
         self.download_button.setVisible(False)
         self.download_button.clicked.connect(self.download_model)
         layout.addWidget(self.download_button)
@@ -526,12 +541,23 @@ class ChatWindow(QMainWindow):
             self.model_status.setText(f"模型就绪 ({size_gb:.1f} GB)")
             self.input_field.setEnabled(True)
             self.send_button.setEnabled(True)
-            self.add_message("系统", "欢迎使用 Qwen30B 大模型对话程序！")
+            model_name = self.models_config[self.current_model_key]['name']
+            self.add_message("系统", f"欢迎使用 {model_name} 大模型对话程序！")
         else:
             self.model_status.setText("模型未找到")
             self.download_button.setVisible(True)
             self.download_button.setEnabled(True)
-            self.add_message("系统", "模型文件未找到。请点击下方'下载模型'按钮从国内镜像下载。\n模型大小约 18GB，下载时间取决于网络速度。")
+            model_info = self.models_config[self.current_model_key]
+            self.add_message("系统", f"模型文件未找到。请点击下方'下载模型'按钮从国内镜像下载。\n当前选择: {model_info['name']}")
+            
+    def on_model_changed(self, index):
+        self.current_model_key = self.model_combo.currentData()
+        config = self.models_config[self.current_model_key]
+        self.model_path = self.app_dir / "model" / config['filename']
+        self.model_url = config['url']
+        
+        self.add_message("系统", f"已切换到: {config['name']}")
+        self.check_model()
             
     def download_model(self):
         self.download_button.setEnabled(False)
