@@ -86,6 +86,7 @@ class InferenceThread(QThread):
         try:
             # 使用临时文件传递 prompt，避免命令行编码问题
             import tempfile
+            
             self.prompt_file = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt', delete=False)
             self.prompt_file.write(self.prompt)
             self.prompt_file.close()
@@ -161,19 +162,45 @@ class ChatWindow(QMainWindow):
         # 模型路径检测
         if getattr(sys, 'frozen', False):
             self.app_dir = Path(sys.executable).parent
-            model_path_1 = self.app_dir / "model" / "Qwen3-30B-A3B-Q4_K_M.gguf"
-            model_path_2 = self.app_dir / "_internal" / "model" / "Qwen3-30B-A3B-Q4_K_M.gguf"
-            llama_path_1 = self.app_dir / "llama-cli.exe"
-            llama_path_2 = self.app_dir / "_internal" / "llama-cli.exe"
+            # 尝试多个可能的模型路径
+            model_paths = [
+                self.app_dir / "model" / "Qwen3-30B-A3B-Q4_K_M.gguf",
+                self.app_dir / "_internal" / "model" / "Qwen3-30B-A3B-Q4_K_M.gguf",
+                self.app_dir / "Qwen3-30B-A3B-Q4_K_M.gguf",
+                self.app_dir / "_internal" / "Qwen3-30B-A3B-Q4_K_M.gguf",
+            ]
+            llama_paths = [
+                self.app_dir / "llama-cli.exe",
+                self.app_dir / "_internal" / "llama-cli.exe",
+            ]
             
-            self.model_path = model_path_1 if model_path_1.exists() else model_path_2
-            self.llama_path = llama_path_1 if llama_path_1.exists() else llama_path_2
+            # 找到存在的路径
+            self.model_path = None
+            for path in model_paths:
+                if path.exists():
+                    self.model_path = path
+                    break
+            
+            self.llama_path = None
+            for path in llama_paths:
+                if path.exists():
+                    self.llama_path = path
+                    break
+            
+            # 如果没找到，使用默认路径（后续会提示下载）
+            if not self.model_path:
+                self.model_path = model_paths[0]
+            if not self.llama_path:
+                self.llama_path = llama_paths[1]  # _internal 目录
         else:
             self.app_dir = Path(__file__).parent
             self.llama_path = self.app_dir / "llama-cli.exe"
             self.model_path = self.app_dir / "model" / "Qwen3-30B-A3B-Q4_K_M.gguf"
         
         self.model_url = "https://hf-mirror.com/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
+        
+        # 读取知识库文件夹中的所有 txt 文件
+        self.knowledge_base = self.load_knowledge_base()
         
         self.chat_history = []
         self.current_thread = None
@@ -182,6 +209,28 @@ class ChatWindow(QMainWindow):
         self.init_ui()
         QTimer.singleShot(100, self.check_model)
         QTimer.singleShot(200, self.detect_gpu_and_set_default)
+    
+    def load_knowledge_base(self):
+        # 尝试从 knowledge 文件夹读取所有 txt 文件
+        knowledge_paths = [
+            self.app_dir / "knowledge",
+            self.app_dir / "_internal" / "knowledge",
+        ]
+        
+        all_content = ""
+        for kb_dir in knowledge_paths:
+            if kb_dir.exists() and kb_dir.is_dir():
+                for txt_file in sorted(kb_dir.glob("*.txt")):
+                    try:
+                        with open(txt_file, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            all_content += f"=== {txt_file.name} ===\n"
+                            all_content += content
+                            all_content += "\n\n"
+                    except Exception as e:
+                        pass
+        
+        return all_content
         
     def init_ui(self):
         central_widget = QWidget()
@@ -461,7 +510,16 @@ class ChatWindow(QMainWindow):
         self.current_thread.start()
         
     def build_prompt(self):
+        # 构建系统提示词
         prompt = "你是一个有帮助的AI助手，请用中文回答用户的问题。\n\n"
+        
+        # 如果有知识库，将其添加到提示词中
+        if self.knowledge_base:
+            prompt += "以下是公司的规章制度知识库，当用户询问关于公司实习生管理、实习补贴、实习流程等相关问题时，请根据此知识库的内容进行回答：\n\n"
+            prompt += "---知识库开始---\n"
+            prompt += self.knowledge_base
+            prompt += "\n---知识库结束---\n\n"
+            prompt += "请注意：当用户问及知识库相关问题时，请根据知识库内容准确回答；对于知识库以外的其他问题，请根据你的通用知识进行回答。\n\n"
         
         for msg in self.chat_history[-10:]:
             if msg['role'] == 'user':
