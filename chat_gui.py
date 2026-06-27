@@ -104,6 +104,11 @@ class InferenceThread(QThread):
                 "-r", "用户:"
             ]
             
+            # 如果使用 CPU 模式，强制指定不使用 GPU 设备，避免 Vulkan 初始化
+            if self.params.get('gpu_layers', 0) == 0:
+                cmd.append("--device")
+                cmd.append("none")
+            
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -159,6 +164,9 @@ class ChatWindow(QMainWindow):
         self.setWindowTitle("Qwen30B 大模型对话程序")
         self.setGeometry(100, 100, 900, 700)
         
+        # 回退到CPU模式的标志
+        self.fallback_to_cpu = False
+        
         # 模型路径检测
         if getattr(sys, 'frozen', False):
             self.app_dir = Path(sys.executable).parent
@@ -209,6 +217,9 @@ class ChatWindow(QMainWindow):
         self.init_ui()
         QTimer.singleShot(100, self.check_model)
         QTimer.singleShot(200, self.detect_gpu_and_set_default)
+        # 默认使用 CPU 模式，跳过 Vulkan 测试以节省启动时间
+        self.fallback_to_cpu = True
+        self.gpu_spin.setValue(0)
     
     def load_knowledge_base(self):
         # 尝试从 knowledge 文件夹读取所有 txt 文件
@@ -323,6 +334,12 @@ class ChatWindow(QMainWindow):
         self.send_button.setEnabled(False)
         
     def detect_gpu_and_set_default(self):
+        # 如果已经设置为 CPU 模式，不再覆盖
+        if self.fallback_to_cpu:
+            self.gpu_spin.setValue(0)
+            self.model_status.setText(f"{self.model_status.text()} | 使用CPU模式")
+            return
+        
         vram_gb = self.get_gpu_vram()
         gpu_name = self.get_gpu_name()
         
@@ -348,6 +365,85 @@ class ChatWindow(QMainWindow):
             self.model_status.setText(f"{self.model_status.text()} | GPU: {gpu_name} ({vram_gb:.0f}GB)，建议GPU层: {gpu_layers}")
         
         self.gpu_spin.setValue(gpu_layers)
+        
+    def check_vulkan_support(self):
+        if not self.llama_path.exists():
+            return
+        
+        if not self.model_path.exists():
+            return
+        
+        vulkan_dll_exists = True
+        try:
+            import ctypes
+            ctypes.WinDLL('vulkan-1.dll')
+        except Exception:
+            vulkan_dll_exists = False
+        
+        if not vulkan_dll_exists:
+            self.fallback_to_cpu = True
+            self.model_status.setText(f"{self.model_status.text()} | Vulkan DLL 不存在，使用CPU模式")
+            self.gpu_spin.setValue(0)
+            self.add_message("系统", "系统未安装 Vulkan 运行时，已自动切换到 CPU 模式。")
+            return
+        
+        self.add_message("系统", "正在检测 Vulkan GPU 加速兼容性...")
+        
+        import tempfile
+        
+        test_file = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt', delete=False)
+        test_file.write("test")
+        test_file.close()
+        
+        test_thread = threading.Thread(target=self._run_vulkan_test, args=(test_file.name,))
+        test_thread.start()
+    
+    def _run_vulkan_test(self, test_file_path):
+        try:
+            result = subprocess.run(
+                [str(self.llama_path), '-m', str(self.model_path), '-f', test_file_path, 
+                 '-n', '1', '-ngl', '1', '--no-display-prompt', '-c', '512'],
+                capture_output=True, text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=60
+            )
+            
+            try:
+                os.unlink(test_file_path)
+            except:
+                pass
+            
+            stderr_lower = result.stderr.lower() if result.stderr else ""
+            
+            if result.returncode != 0 or 'ggml_vulkan' in stderr_lower and 'error' in stderr_lower:
+                self.fallback_to_cpu = True
+                QTimer.singleShot(0, lambda: self._update_vulkan_status(False, "Vulkan 运行时错误，使用CPU模式"))
+            else:
+                QTimer.singleShot(0, lambda: self._update_vulkan_status(True, "Vulkan 支持 ✓"))
+                
+        except subprocess.TimeoutExpired:
+            try:
+                os.unlink(test_file_path)
+            except:
+                pass
+            self.fallback_to_cpu = True
+            QTimer.singleShot(0, lambda: self._update_vulkan_status(False, "Vulkan 检测超时，使用CPU模式"))
+        except Exception as e:
+            try:
+                os.unlink(test_file_path)
+            except:
+                pass
+            self.fallback_to_cpu = True
+            QTimer.singleShot(0, lambda: self._update_vulkan_status(False, f"Vulkan 检测异常: {str(e)[:30]}"))
+    
+    def _update_vulkan_status(self, success, message):
+        if success:
+            self.model_status.setText(f"{self.model_status.text()} | {message}")
+        else:
+            self.fallback_to_cpu = True
+            self.model_status.setText(f"{self.model_status.text()} | {message}")
+            self.gpu_spin.setValue(0)
+            self.add_message("系统", "检测到 Vulkan GPU 加速存在兼容性问题，已自动切换到 CPU 模式。")
         
     def get_gpu_vram(self):
         try:
@@ -486,15 +582,19 @@ class ChatWindow(QMainWindow):
         self.chat_history.append({"role": "user", "content": user_input})
         
         self.input_field.clear()
+        self.run_inference()
+        
+    def run_inference(self):
         self.send_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         
         prompt = self.build_prompt()
         
+        gpu_layers = 0 if self.fallback_to_cpu else self.gpu_spin.value()
         params = {
             'temperature': self.temp_spin.value() / 100,
             'context_size': self.ctx_spin.value(),
-            'gpu_layers': self.gpu_spin.value(),
+            'gpu_layers': gpu_layers,
             'max_tokens': 2048
         }
         
@@ -536,6 +636,17 @@ class ChatWindow(QMainWindow):
         
     def on_error(self, error):
         self.add_message("系统", f"错误: {error}")
+        
+        # 检测是否是GPU相关错误，如果是则尝试回退到CPU模式
+        gpu_error_keywords = ['ggml_vulkan', 'Missing op', 'Vulkan', 'GPU']
+        if any(keyword in error for keyword in gpu_error_keywords) and not self.fallback_to_cpu:
+            self.fallback_to_cpu = True
+            self.add_message("系统", "检测到GPU错误，自动切换到CPU模式重新尝试...")
+            
+            # 重新运行推理，使用CPU模式（不会重复添加用户消息）
+            self.run_inference()
+            return
+        
         self.reset_ui()
         
     def on_finished(self):
